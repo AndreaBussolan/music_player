@@ -1,0 +1,10 @@
+# Compiled Python files
+**/__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE / Editor configurations
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
