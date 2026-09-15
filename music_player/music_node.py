@@ -48,6 +48,33 @@ def clean_subprocess_env():
     return env
 
 
+def log_clock_offset(get_logger, hostname):
+    """
+    Best-effort diagnostic: log this machine's NTP offset from chrony so
+    sync problems can be told apart from buffering problems. Never fatal --
+    if chrony isn't installed or reachable this just logs a warning.
+    """
+    try:
+        result = subprocess.run(
+            ['chronyc', 'tracking'],
+            capture_output=True, text=True, timeout=2.0,
+        )
+        offset_line = next(
+            (l for l in result.stdout.splitlines() if l.startswith('System time')),
+            None,
+        )
+        if offset_line:
+            get_logger().info(f'[{hostname}] chrony: {offset_line.strip()}')
+        else:
+            get_logger().warn(
+                f'[{hostname}] could not parse chronyc tracking output '
+                f'-- is chrony installed and running?')
+    except Exception as e:
+        get_logger().warn(
+            f'[{hostname}] chronyc not available ({e}); clock sync quality '
+            f'unknown. Install/run chrony on every machine.')
+
+
 class MpvIpc:
     """Minimal client for mpv's JSON IPC socket (--input-ipc-server)."""
 
@@ -131,7 +158,14 @@ class MusicNode(Node):
       {"value": <0-100>}
     """
 
-    LOAD_WAIT_TIMEOUT = 15.0  # max seconds to wait for media to be ready
+    LOAD_WAIT_TIMEOUT = 15.0   # max seconds to wait for media to be ready
+    MIN_BUFFER_AHEAD_S = 3.0   # seconds of audio that must be pre-buffered
+                               # before we consider mpv "ready" -- this is
+                               # what actually prevents a post-unpause stall,
+                               # unlike just checking that duration is known
+    BUSY_WAIT_MARGIN_S = 0.02  # final slice done via a tight spin-loop
+                               # instead of time.sleep(), since sleep() can
+                               # wake several ms late depending on OS load
     DEFAULT_VOLUME = 100.0
 
     def __init__(self):
@@ -172,6 +206,8 @@ class MusicNode(Node):
         self.volume_sub = self.create_subscription(
             String, '/music/volume', self.on_volume, volume_qos)
         self.status_pub = self.create_publisher(String, '/music/status', command_qos)
+
+        log_clock_offset(self.get_logger, self.hostname)
 
         self.get_logger().info(
             f'[{self.hostname}] music_node ready (mpv: {self._mpv_bin}), '
@@ -249,6 +285,14 @@ class MusicNode(Node):
             cmd = [
                 self._mpv_bin, '--no-video', '--ytdl', '--idle=yes', '--pause',
                 f'--input-ipc-server={sock_path}',
+                # Pre-buffer aggressively so that unpausing at start_at
+                # doesn't have to wait on the network -- this is the main
+                # source of "sometimes lags more, sometimes less", since
+                # that stall length depends on each machine's link at that
+                # exact moment.
+                '--cache=yes',
+                '--cache-secs=30',
+                '--demuxer-readahead-secs=20',
             ]
             self.get_logger().info(
                 f'[{self.hostname}] running: '
@@ -277,7 +321,7 @@ class MusicNode(Node):
             self._ipc.command('loadfile', target, 'replace')
             self.publish_status(f'loading: {query}')
 
-        # Wait until media is actually ready to play (outside the lock,
+        # Wait until media is actually pre-buffered (outside the lock,
         # so a stop/pause/skip command can still interrupt promptly).
         ready = self._wait_until_ready()
         if not ready:
@@ -287,7 +331,7 @@ class MusicNode(Node):
         if start_at:
             delay = start_at - time.time()
             if delay > 0:
-                time.sleep(delay)
+                self._sleep_until(start_at)
             else:
                 self.get_logger().warn(
                     f'[{self.hostname}] start_at already in the past by {-delay:.3f}s, '
@@ -298,14 +342,41 @@ class MusicNode(Node):
                 self._ipc.command('set_property', 'pause', False)
         self.publish_status(f'playing: {query}')
 
+    def _sleep_until(self, target_time: float):
+        """
+        Sleep until target_time as precisely as possible.
+
+        time.sleep() alone can wake anywhere from 0 to ~15ms late depending
+        on OS scheduling -- fine normally, but enough to be audible when
+        several machines are meant to start in the same instant. So: sleep
+        coarsely (cheap on CPU) for most of the wait, then busy-spin the
+        last small slice for sub-millisecond precision.
+        """
+        margin = self.BUSY_WAIT_MARGIN_S
+        remaining = target_time - time.time()
+        if remaining > margin:
+            time.sleep(remaining - margin)
+        while time.time() < target_time:
+            pass
+
     def _wait_until_ready(self):
+        """
+        Wait until mpv has both parsed the media's duration AND actually
+        buffered enough audio ahead of the playback position. Checking
+        duration alone (as before) only confirms metadata was read -- it
+        says nothing about whether unpausing will hit a network stall,
+        which is exactly what caused inconsistent lag between machines.
+        """
         deadline = time.time() + self.LOAD_WAIT_TIMEOUT
         while time.time() < deadline:
             with self._lock:
                 if not self._ipc:
                     return False
                 duration = self._ipc.get_property('duration', timeout=1.0)
-            if duration:
+                cache_ahead = self._ipc.get_property(
+                    'demuxer-cache-duration', timeout=1.0)
+            if duration and cache_ahead is not None and \
+                    cache_ahead >= self.MIN_BUFFER_AHEAD_S:
                 return True
             time.sleep(0.1)
         return False
@@ -368,3 +439,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+    
